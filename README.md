@@ -32,7 +32,7 @@ Codex ▐●●●●●●○○○ 71%▐   GLM ▐●●●●●●●●○
 要求:macOS 14+,Swift 6 工具链(Xcode 16+ 或 swiftly)。
 
 ```sh
-git clone https://github.com/<you>/AIQuotaBar.git
+git clone https://github.com/ListenTo-TheWind/AIQuotaBar.git
 cd AIQuotaBar
 scripts/install.sh     # release 构建 → 打包 .app → 装配 LaunchAgent 开机自启 → 启动
 ```
