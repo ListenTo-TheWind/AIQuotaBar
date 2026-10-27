@@ -1,0 +1,4 @@
+.build/
+AIQuotaBar.app/
+.DS_Store
+*.o

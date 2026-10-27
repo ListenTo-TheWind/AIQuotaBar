@@ -1,0 +1,19 @@
+#!/bin/zsh
+set -euo pipefail
+
+root="${0:A:h:h}"
+app="$root/AIQuotaBar.app"
+
+case "${1:-start}" in
+  start)
+    cd "$root"
+    swift build
+    mkdir -p "$app/Contents/MacOS"
+    cp "$root/app/Info.plist" "$app/Contents/Info.plist"
+    cp "$root/.build/debug/AIQuotaBar" "$app/Contents/MacOS/AIQuotaBar"
+    open -n "$app"
+    ;;
+  stop) pkill -f 'AIQuotaBar.app/Contents/MacOS/AIQuotaBar' || true ;;
+  status) pgrep -fl 'AIQuotaBar.app/Contents/MacOS/AIQuotaBar' || true ;;
+  *) print 'Usage: scripts/quota-bar [start|stop|status]'; exit 2 ;;
+esac
