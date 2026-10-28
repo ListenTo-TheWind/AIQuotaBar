@@ -3,8 +3,11 @@ import Foundation
 import SwiftUI
 
 private let logURL = URL(fileURLWithPath: "/tmp/aiq-state.log")
+/// ISO8601DateFormatter 线程安全;避免每次写日志都分配一个 formatter
+private nonisolated(unsafe) let logTimestampFormatter = ISO8601DateFormatter()
+
 private func log(_ message: String) {
-    let line = "[\(ISO8601DateFormatter().string(from: .now))] \(message)\n"
+    let line = "[\(logTimestampFormatter.string(from: .now))] \(message)\n"
     if let data = line.data(using: .utf8) {
         if FileManager.default.fileExists(atPath: logURL.path), let handle = try? FileHandle(forWritingTo: logURL) {
             _ = try? handle.seekToEnd(); try? handle.write(contentsOf: data); try? handle.close()
@@ -35,7 +38,9 @@ struct Quota: Codable, Equatable, Sendable {
 protocol QuotaProvider: Sendable {
     var id: String { get }
     var displayName: String { get }
-    func fetch(completion: @escaping @Sendable (Result<Quota, Error>) -> Void)
+    /// 拉取额度(0-1 的剩余比例)。网络、鉴权、解析等任何失败都以 throw 报告,
+    /// 由刷新循环统一记录日志并把该套餐显示为 "—";provider 内部不再各自兜底。
+    func fetchQuota() async throws -> Quota
 }
 
 /// Reads the latest actual Codex `rate_limits` payload from local session JSONL files.
@@ -44,37 +49,69 @@ final class CodexProvider: QuotaProvider, @unchecked Sendable {
     let id = "codex"
     let displayName = "Codex"
 
-    func fetch(completion: @escaping @Sendable (Result<Quota, Error>) -> Void) {
-        DispatchQueue.global(qos: .utility).async {
-            let sessions = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".codex/sessions")
-            let enumerator = FileManager.default.enumerator(at: sessions, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])
-            var candidates: [(URL, Date)] = []
-            while let url = enumerator?.nextObject() as? URL {
-                guard url.pathExtension == "jsonl" else { continue }
-                let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-                candidates.append((url, date))
-            }
-            for (url, _) in candidates.sorted(by: { $0.1 > $1.1 }).prefix(12) {
-                guard let text = try? String(contentsOf: url), let last = text.split(separator: "\n").reversed().first(where: { $0.contains("rate_limits") }), let data = last.data(using: .utf8), let json = try? JSONSerialization.jsonObject(with: data), let limits = findDictionary(named: "rate_limits", in: json) else { continue }
-                let windows = [limits["primary"], limits["secondary"]].compactMap { $0 as? [String: Any] }
-                let weekly = remaining(forWindowNear: 10_080, in: windows)
-                    ?? windows.compactMap(remaining(in:)).first
-                let fiveHour = windows
-                    .filter { number($0["window_minutes"]) ?? 0 >= 300 && number($0["window_minutes"]) ?? 0 < 10_080 }
-                    .compactMap(remaining(in:))
-                    .first
-                if weekly != nil || fiveHour != nil {
-                    completion(.success(Quota(fiveHourRemaining: fiveHour, weeklyRemaining: weekly, updatedAt: .now)))
-                    return
-                }
-            }
-            log("Codex rate_limits missing from recent sessions")
-            completion(.success(.unavailable))
+    /// rate_limits 快照随会话追加,最新一条总在文件末尾附近,只读末尾这段即可,
+    /// 避免 session 文件(可达数 MB)整文件读入内存。
+    private static let tailBytes = 524_288
+    private static let maxFiles = 12
+
+    func fetchQuota() async throws -> Quota {
+        let quota = await Task.detached(priority: .utility) { () -> Quota? in
+            Self.scanSessions()
+        }.value
+        guard let quota else {
+            throw FetchError.parse("rate_limits missing from latest \(Self.maxFiles) sessions")
         }
+        return quota
+    }
+
+    private static func scanSessions() -> Quota? {
+        let sessions = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".codex/sessions")
+        let enumerator = FileManager.default.enumerator(at: sessions, includingPropertiesForKeys: [.contentModificationDateKey])
+        var candidates: [(URL, Date)] = []
+        while let url = enumerator?.nextObject() as? URL {
+            guard url.pathExtension == "jsonl" else { continue }
+            let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            candidates.append((url, date))
+        }
+        let newest = candidates.sorted { $0.1 > $1.1 }.prefix(maxFiles)
+        for (url, _) in newest {
+            if let quota = quota(inTailOfFile: url) { return quota }
+        }
+        // 极端情况下 tail 截断可能截掉唯一的 rate_limits 行,退回整文件读最新的一个
+        if let (url, _) = newest.first, let text = try? String(contentsOf: url, encoding: .utf8) {
+            return quota(from: text)
+        }
+        return nil
+    }
+
+    private static func quota(inTailOfFile url: URL) -> Quota? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd(), end > 0 else { return nil }
+        try? handle.seek(toOffset: end > UInt64(tailBytes) ? end - UInt64(tailBytes) : 0)
+        return quota(from: String(decoding: handle.readData(ofLength: tailBytes), as: UTF8.self))
+    }
+
+    private static func quota(from text: String) -> Quota? {
+        guard let last = text.split(separator: "\n").reversed().first(where: { $0.contains("rate_limits") }),
+              let data = last.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data),
+              let limits = findDictionary(named: "rate_limits", in: json) else { return nil }
+        let windows = [limits["primary"], limits["secondary"]].compactMap { $0 as? [String: Any] }
+        let fiveHour = windows
+            .filter { (number($0["window_minutes"]) ?? 0) >= 300 && (number($0["window_minutes"]) ?? 0) < 10_080 }
+            .compactMap(remaining(in:))
+            .first
+        // 周窗口必须真实存在(minutes >= 4320,取最接近 10080 的一个),
+        // 否则只有 5h 窗口的会话会把 5 小时额度错标成周额度
+        let weeklyWindows = windows.filter { (number($0["window_minutes"]) ?? 0) >= 4_320 }
+        let weekly = remaining(forWindowNear: 10_080, in: weeklyWindows)
+        if fiveHour == nil && weekly == nil { return nil }
+        return Quota(fiveHourRemaining: fiveHour, weeklyRemaining: weekly, updatedAt: .now)
     }
 }
 
-private func remaining(forWindowNear target: Double, in windows: [[String: Any]]) -> Double? {
+func remaining(forWindowNear target: Double, in windows: [[String: Any]]) -> Double? {
     windows
         .compactMap { window -> (distance: Double, remaining: Double)? in
             guard let minutes = number(window["window_minutes"]), let value = remaining(in: window) else { return nil }
@@ -84,7 +121,7 @@ private func remaining(forWindowNear target: Double, in windows: [[String: Any]]
         .remaining
 }
 
-private func findDictionary(named key: String, in value: Any) -> [String: Any]? {
+func findDictionary(named key: String, in value: Any) -> [String: Any]? {
     if let dict = value as? [String: Any] {
         if let match = dict[key] as? [String: Any] { return match }
         for child in dict.values { if let match = findDictionary(named: key, in: child) { return match } }
@@ -94,104 +131,133 @@ private func findDictionary(named key: String, in value: Any) -> [String: Any]? 
     return nil
 }
 
-private func percentage(in dictionary: [String: Any]?) -> Double? {
+func percentage(in dictionary: [String: Any]?) -> Double? {
     guard let raw = number(dictionary?["used_percent"]) ?? number(dictionary?["usedPercent"]) else { return nil }
     return min(1, max(0, raw > 1 ? raw / 100 : raw))
 }
 
-private func remaining(in dictionary: [String: Any]) -> Double? {
+func remaining(in dictionary: [String: Any]) -> Double? {
     percentage(in: dictionary).map { 1 - $0 }
 }
 
-private func number(_ value: Any?) -> Double? {
+func number(_ value: Any?) -> Double? {
     if let value = value as? NSNumber { return value.doubleValue }
     if let value = value as? String { return Double(value) }
     return nil
 }
 
-private enum SecretStore {
+/// 初始化向导保存的密钥:明文存本机 UserDefaults,与自定义套餐密钥同级,不随仓库分发。
+enum SecretOverrides {
+    static let defaultsKey = "secretOverrides"
+
+    private static var all: [String: String] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let dict = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+        return dict
+    }
+
     static func value(named name: String) -> String? {
+        guard let value = all[name], !value.isEmpty else { return nil }
+        return value
+    }
+
+    static func set(name: String, value: String) {
+        var dict = all
+        dict[name] = value
+        if let data = try? JSONEncoder().encode(dict) {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
+    }
+
+    static func remove(name: String) {
+        var dict = all
+        dict.removeValue(forKey: name)
+        if let data = try? JSONEncoder().encode(dict) {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
+    }
+}
+
+/// 密钥读取。优先级:环境变量 → 初始化向导保存 → ~/.zshrc。
+/// actor 隔离内部缓存:zshrc 按修改时间缓存,改动后 30 秒内下一次拉取自动生效,无需重启 app。
+actor SecretStore {
+    static let shared = SecretStore()
+
+    private var zshrcCache: (mtime: Date, text: String)?
+
+    func value(named name: String) -> String? {
         if let value = ProcessInfo.processInfo.environment[name], !value.isEmpty { return value }
-        let rc = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".zshrc")
-        guard let source = try? String(contentsOf: rc, encoding: .utf8) else { return nil }
+        if let value = SecretOverrides.value(named: name) { return value }
+        guard let source = zshrcText() else { return nil }
+        return Self.match(name: name, in: source, allowsComment: false)
+    }
+
+    /// 从 zshrc 的指定 plan 块中提取 key（无论是否被注释）
+    func valueFromPlan(keyName: String, plan: String) -> String? {
+        guard let source = zshrcText(),
+              let block = Self.planBlock(source, plan: plan) else { return nil }
+        return Self.match(name: keyName, in: String(block), allowsComment: true)
+    }
+
+    // MARK: - 纯解析(无副作用,便于单元测试)
+
+    /// 提取 "~~~ PLAN: xxx ~~~" 到 "~~~ END: xxx ~~~" 之间的内容
+    static func planBlock(_ source: String, plan: String) -> Substring? {
+        guard let start = source.range(of: "~~~ PLAN: \(plan) ~~~", options: .caseInsensitive),
+              let end = source.range(of: "~~~ END: \(plan) ~~~", options: .caseInsensitive) else { return nil }
+        return source[start.upperBound..<end.lowerBound]
+    }
+
+    static func match(name: String, in source: String, allowsComment: Bool) -> String? {
         let escaped = NSRegularExpression.escapedPattern(for: name)
-        guard let regex = try? NSRegularExpression(pattern: "(?:export\\s+)?\(escaped)\\s*=\\s*[\\\"']?([^\\s\\\"']+)"),
+        let commentPrefix = allowsComment ? "#?\\s*" : ""
+        let pattern = "\(commentPrefix)(?:export\\s+)?\(escaped)\\s*=\\s*[\\\"']?([^\\s\\\"']+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)),
               let range = Range(match.range(at: 1), in: source) else { return nil }
         return String(source[range])
     }
 
-    /// 从 zshrc 的指定 plan 块中提取 key（无论是否被注释）
-    static func valueFromPlan(keyName: String, plan: String) -> String? {
-        let rc = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".zshrc")
-        guard let source = try? String(contentsOf: rc, encoding: .utf8) else { return nil }
-
-        // 查找 plan 块的开始和结束（允许前面有 # 注释符）
-        let startPattern = "~~~ PLAN: \(plan) ~~~"
-        let endPattern = "~~~ END: \(plan) ~~~"
-
-        guard let startRange = source.range(of: startPattern, options: .caseInsensitive),
-              let endRange = source.range(of: endPattern, options: .caseInsensitive) else { return nil }
-
-        // 提取块内容
-        let block = String(source[startRange.upperBound..<endRange.lowerBound])
-
-        // 在块中查找 key（忽略注释符 # 和 export）
-        let escaped = NSRegularExpression.escapedPattern(for: keyName)
-        guard let regex = try? NSRegularExpression(pattern: "#?\\s*(?:export\\s+)?\(escaped)\\s*=\\s*[\\\"']?([^\\s\\\"']+)"),
-              let match = regex.firstMatch(in: block, range: NSRange(block.startIndex..., in: block)),
-              let valueRange = Range(match.range(at: 1), in: block) else { return nil }
-
-        return String(block[valueRange])
+    private func zshrcText() -> String? {
+        let path = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".zshrc")
+        let mtime = (try? FileManager.default.attributesOfItem(atPath: path.path)[.modificationDate]) as? Date
+        if let zshrcCache, zshrcCache.mtime == mtime { return zshrcCache.text }
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return nil }
+        zshrcCache = (mtime ?? .distantPast, text)
+        return text
     }
 }
 final class MiniMaxProvider: QuotaProvider, @unchecked Sendable {
     let id = "minimax"
     let displayName = "MiniMax"
 
-    func fetch(completion: @escaping @Sendable (Result<Quota, Error>) -> Void) {
-        guard let token = SecretStore.valueFromPlan(keyName: "ANTHROPIC_API_KEY", plan: "minimax") else {
-            log("MiniMax: ANTHROPIC_API_KEY not found in minimax plan block")
-            completion(.success(.unavailable))
-            return
+    func fetchQuota() async throws -> Quota {
+        guard let token = await SecretStore.shared.valueFromPlan(keyName: "ANTHROPIC_API_KEY", plan: "minimax") else {
+            throw FetchError.parse("ANTHROPIC_API_KEY not found in minimax plan block")
         }
         // Token Plan quota endpoint. Docs: platform.minimax.io/docs/token-plan/faq.
         // The legacy /v1/api/openplatform/coding_plan/remains requires browser cookies,
         // so the bar must call /v1/token_plan/remains instead.
-        fetchData(url: "https://api.minimax.chat/v1/token_plan/remains", token: token) { result in
-            switch result {
-            case .failure(let error):
-                log("MiniMax fetch failed: \(error.localizedDescription)")
-                completion(.success(.unavailable))
-            case .success(let data):
-                let decoder = JSONDecoder()
-                decoder.keyDecodingStrategy = .convertFromSnakeCase
-                guard let decoded = try? decoder.decode(MiniMaxQuotaResponse.self, from: data) else {
-                    let snippet = String(data: data.prefix(160), encoding: .utf8) ?? ""
-                    log("MiniMax: response decode failed: \(snippet)")
-                    completion(.success(.unavailable))
-                    return
-                }
-                // Token Plan returns one entry per model. Surface the tightest remaining
-                // % so the bar reflects the most constrained quota rather than silently
-                // mixing in the most generous one.
-                // API returns percentages (0-100), convert to fractions (0-1) for storage.
-                let weekly = decoded.modelRemains
-                    .compactMap { $0.currentWeeklyRemainingPercent }
-                    .min()
-                    .map { $0 / 100 }
-                let interval = decoded.modelRemains
-                    .compactMap { $0.currentIntervalRemainingPercent }
-                    .min()
-                    .map { $0 / 100 }
-                log("MiniMax: \(decoded.modelRemains.count) model(s) weekly=\(weekly.map { String(format: "%.2f", $0) } ?? "-") interval=\(interval.map { String(format: "%.2f", $0) } ?? "-")")
-                completion(.success(Quota(
-                    fiveHourRemaining: interval,
-                    weeklyRemaining: weekly,
-                    updatedAt: .now
-                )))
-            }
+        let data = try await HTTP.getJSON("https://api.minimax.chat/v1/token_plan/remains", token: token)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let decoded = try? decoder.decode(MiniMaxQuotaResponse.self, from: data) else {
+            throw FetchError.parse("response decode failed: \(bodySnippet(data))")
         }
+        // Token Plan returns one entry per model. Surface the tightest remaining
+        // % so the bar reflects the most constrained quota rather than silently
+        // mixing in the most generous one.
+        // API returns percentages (0-100), convert to fractions (0-1) for storage.
+        let weekly = decoded.modelRemains
+            .compactMap { $0.currentWeeklyRemainingPercent }
+            .min()
+            .map { $0 / 100 }
+        let interval = decoded.modelRemains
+            .compactMap { $0.currentIntervalRemainingPercent }
+            .min()
+            .map { $0 / 100 }
+        log("MiniMax: \(decoded.modelRemains.count) model(s) weekly=\(weekly.map { String(format: "%.2f", $0) } ?? "-") interval=\(interval.map { String(format: "%.2f", $0) } ?? "-")")
+        return Quota(fiveHourRemaining: interval, weeklyRemaining: weekly, updatedAt: .now)
     }
 }
 
@@ -208,57 +274,44 @@ final class ZenMuxProvider: QuotaProvider, @unchecked Sendable {
     let id = "zenmux"
     let displayName = "ZenMux"
 
-    func fetch(completion: @escaping @Sendable (Result<Quota, Error>) -> Void) {
-        // Prefer the dedicated Management API key. It intentionally lives outside
-        // the switchable provider plan and may be commented out in ~/.zshrc because
-        // this app reads the file directly rather than sourcing it in a shell.
-        let token = SecretStore.value(named: "ZENMUX_MANAGEMENT_KEY")
-            ?? SecretStore.value(named: "ZENMUX_MGMT_KEY")
-            ?? SecretStore.valueFromPlan(keyName: "ANTHROPIC_API_KEY", plan: "zenmux")
+    func fetchQuota() async throws -> Quota {
+        let token = await Self.managementToken()
         guard let token else {
-            log("ZenMux: ZENMUX_MGMT_KEY not found")
-            completion(.success(.unavailable))
-            return
+            throw FetchError.parse("ZENMUX_MGMT_KEY not found")
         }
+
         // Management keys currently use sk-mg-v1-*; retain the older sk-mgmt-*
         // spelling for compatibility. Subscription keys (sk-ss-v1-*) cannot
         // access the management quota endpoint.
         let isManagementKey = token.hasPrefix("sk-mg-v1-") || token.hasPrefix("sk-mgmt-")
-        if !isManagementKey {
-            log("ZenMux: non-management key detected. Quota API requires ZENMUX_MGMT_KEY (sk-mg-v1-*). See: zenmux.ai/platform/management")
-            completion(.success(.unavailable))
-            return
+        guard isManagementKey else {
+            throw FetchError.parse("non-management key detected. Quota API requires ZENMUX_MGMT_KEY (sk-mg-v1-*). See: zenmux.ai/platform/management")
         }
         // /v1/management/* requires a Management API Key (not sk-ss-v1-* subscription key).
         // Without the correct key type, the server returns 403.
         // See: zenmux.ai/docs/api/platform/subscription-detail
-        fetchData(url: "https://zenmux.ai/api/v1/management/subscription/detail", token: token) { result in
-            switch result {
-            case .failure(let error):
-                log("ZenMux fetch failed: \(error.localizedDescription)")
-                completion(.success(.unavailable))
-            case .success(let data):
-                let decoder = JSONDecoder()
-                decoder.keyDecodingStrategy = .convertFromSnakeCase
-                guard let decoded = try? decoder.decode(ZenMuxSubscriptionDetail.self, from: data),
-                      decoded.success,
-                      let payload = decoded.data else {
-                    let snippet = String(data: data.prefix(160), encoding: .utf8) ?? ""
-                    log("ZenMux: response decode failed or success=false: \(snippet)")
-                    completion(.success(.unavailable))
-                    return
-                }
-                // usage_percentage is a 0-1 fraction. remaining = 1 - usage.
-                let fiveHour = Self.remaining(payload.quota5Hour?.usagePercentage)
-                let weekly = Self.remaining(payload.quota7Day?.usagePercentage)
-                log("ZenMux: tier=\(payload.plan?.tier ?? "-") 5h=\(fiveHour.map { String(format: "%.2f", $0) } ?? "-") week=\(weekly.map { String(format: "%.2f", $0) } ?? "-")")
-                completion(.success(Quota(
-                    fiveHourRemaining: fiveHour,
-                    weeklyRemaining: weekly,
-                    updatedAt: .now
-                )))
-            }
+        let data = try await HTTP.getJSON("https://zenmux.ai/api/v1/management/subscription/detail", token: token)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let decoded = try? decoder.decode(ZenMuxSubscriptionDetail.self, from: data),
+              decoded.success,
+              let payload = decoded.data else {
+            throw FetchError.parse("response decode failed or success=false: \(bodySnippet(data))")
         }
+        // usage_percentage is a 0-1 fraction. remaining = 1 - usage.
+        let fiveHour = Self.remaining(payload.quota5Hour?.usagePercentage)
+        let weekly = Self.remaining(payload.quota7Day?.usagePercentage)
+        log("ZenMux: tier=\(payload.plan?.tier ?? "-") 5h=\(fiveHour.map { String(format: "%.2f", $0) } ?? "-") week=\(weekly.map { String(format: "%.2f", $0) } ?? "-")")
+        return Quota(fiveHourRemaining: fiveHour, weeklyRemaining: weekly, updatedAt: .now)
+    }
+
+    private static func managementToken() async -> String? {
+        // Prefer the dedicated Management API key. It intentionally lives outside
+        // the switchable provider plan and may be commented out in ~/.zshrc because
+        // this app reads the file directly rather than sourcing it in a shell.
+        if let key = await SecretStore.shared.value(named: "ZENMUX_MANAGEMENT_KEY") { return key }
+        if let key = await SecretStore.shared.value(named: "ZENMUX_MGMT_KEY") { return key }
+        return await SecretStore.shared.valueFromPlan(keyName: "ANTHROPIC_API_KEY", plan: "zenmux")
     }
 
     private static func remaining(_ usage: Double?) -> Double? {
@@ -283,57 +336,134 @@ private struct ZenMuxSubscriptionDetail: Decodable {
     }
 }
 
-/// 智谱 GLM Coding Plan 额度。接口未公开文档,与官方 glm-plan-usage 插件一致:
+/// GitHub Copilot 额度。接口无官方文档但被社区工具广泛使用(pi-copilot-usage、tokscale 等):
+/// GET https://api.github.com/copilot_internal/user(Authorization: token <PAT>)
+/// → quota_snapshots.{premiumInteractions,chat,completions}.{percentRemaining,unlimited}。
+/// premium_interactions 为月度高级请求额度,显示在 W 列;chat/completions 多数套餐 unlimited。
+/// 内部接口,字段若变更会导致解析失败,日志会带响应片段。
+final class GitHubCopilotProvider: QuotaProvider, @unchecked Sendable {
+    let id = "copilot"
+    let displayName = "Copilot"
+
+    func fetchQuota() async throws -> Quota {
+        guard let token = await Self.patToken() else {
+            throw FetchError.parse("未设置 GITHUB_TOKEN(GitHub PAT,需 Copilot 订阅)")
+        }
+        let data = try await HTTP.getJSON("https://api.github.com/copilot_internal/user", token: token, authPrefix: "token")
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let decoded = try? decoder.decode(CopilotUserResponse.self, from: data) else {
+            throw FetchError.parse("response decode failed: \(bodySnippet(data))")
+        }
+        let quota = Self.quotaFraction(decoded)
+        guard quota.weekly != nil else {
+            throw FetchError.parse("no premium quota snapshot; sku=\(decoded.accessTypeSku ?? "-")")
+        }
+        log("Copilot: sku=\(decoded.accessTypeSku ?? "-") premium=\(quota.weekly.map(percent) ?? "-")")
+        return Quota(fiveHourRemaining: nil, weeklyRemaining: quota.weekly, updatedAt: .now)
+    }
+
+    /// PAT 读取顺序:环境变量 → 向导保存 → zshrc
+    private static func patToken() async -> String? {
+        if let token = await SecretStore.shared.value(named: "GITHUB_TOKEN") { return token }
+        return await SecretStore.shared.value(named: "GH_TOKEN")
+    }
+
+    /// premium_interactions 剩余比例(0-1);unlimited 视为满格。暴露 static 供单元测试。
+    static func quotaFraction(_ decoded: CopilotUserResponse) -> (weekly: Double?, chat: Double?) {
+        let snapshots = decoded.quotaSnapshots
+        let premium = snapshots?.premiumInteractions.map { snapshot in
+            snapshot.unlimited == true ? 1.0 : snapshot.percentRemaining.map { min(1, max(0, $0 / 100)) }
+        }
+        let chat = snapshots?.chat.map { snapshot in
+            snapshot.unlimited == true ? 1.0 : snapshot.percentRemaining.map { min(1, max(0, $0 / 100)) }
+        }
+        return (premium ?? nil, chat ?? nil)
+    }
+}
+
+struct CopilotUserResponse: Decodable {
+    let accessTypeSku: String?
+    let quotaResetDate: String?
+    let quotaSnapshots: QuotaSnapshots?
+
+    struct QuotaSnapshots: Decodable {
+        let premiumInteractions: Snapshot?
+        let chat: Snapshot?
+        let completions: Snapshot?
+    }
+
+    struct Snapshot: Decodable {
+        let percentRemaining: Double?
+        let unlimited: Bool?
+        let entitlement: Double?
+    }
+}
+
+/// 智谱 GLM Coding Plan 额度(国内 open.bigmodel.cn / 国际 api.z.ai 同构)。
+/// 接口未公开文档,与官方 glm-plan-usage 插件一致:
 /// GET /api/monitor/usage/quota/limit;平台对错误也返回 HTTP 200,必须检查 body 的 success 字段。
 final class GLMProvider: QuotaProvider, @unchecked Sendable {
-    let id = "glm"
-    let displayName = "GLM"
+    let id: String
+    let displayName: String
+    let baseURL: String
+    let keyNames: [String]
+    /// z.ai 文档要求 Authorization 直接放 key 不带 Bearer;bigmodel.cn 保持 Bearer
+    let authPrefix: String?
 
-    static var apiKey: String? {
-        SecretStore.value(named: "BIGMODEL_API_KEY")
-            ?? SecretStore.value(named: "GLM_API_KEY")
-            ?? SecretStore.value(named: "ZHIPU_API_KEY")
+    static let cnBaseURL = "https://open.bigmodel.cn"
+    static let cnKeyNames = ["BIGMODEL_API_KEY", "GLM_API_KEY", "ZHIPU_API_KEY"]
+
+    init(id: String = "glm",
+         displayName: String = "GLM",
+         baseURL: String = GLMProvider.cnBaseURL,
+         keyNames: [String] = GLMProvider.cnKeyNames,
+         authPrefix: String? = "Bearer") {
+        self.id = id
+        self.displayName = displayName
+        self.baseURL = baseURL
+        self.keyNames = keyNames
+        self.authPrefix = authPrefix
     }
 
-    func fetch(completion: @escaping @Sendable (Result<Quota, Error>) -> Void) {
-        guard let token = Self.apiKey else {
-            log("GLM: BIGMODEL_API_KEY 未设置")
-            completion(.success(.unavailable))
-            return
-        }
-        fetchData(url: "https://open.bigmodel.cn/api/monitor/usage/quota/limit", token: token) { result in
-            switch result {
-            case .failure(let error):
-                log("GLM fetch failed: \(error.localizedDescription)")
-                completion(.success(.unavailable))
-            case .success(let data):
-                self.parse(data, completion: completion)
-            }
-        }
+    /// 国际版(z.ai):域名与密钥不同,接口结构与国内一致
+    static func international() -> GLMProvider {
+        GLMProvider(id: "zai", displayName: "GLM国际", baseURL: "https://api.z.ai",
+                    keyNames: ["ZAI_API_KEY", "Z_AI_API_KEY", "GLM_API_KEY"], authPrefix: nil)
     }
 
-    private func parse(_ data: Data, completion: @escaping @Sendable (Result<Quota, Error>) -> Void) {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            log("GLM: response is not JSON")
-            completion(.success(.unavailable))
-            return
+    static func apiKey(named names: [String]) async -> String? {
+        for name in names {
+            if let key = await SecretStore.shared.value(named: name) { return key }
         }
+        return nil
+    }
+
+    func fetchQuota() async throws -> Quota {
+        guard let token = await Self.apiKey(named: keyNames) else {
+            throw FetchError.parse("未设置 \(keyNames.joined(separator: "/"))")
+        }
+        let data = try await HTTP.getJSON("\(baseURL)/api/monitor/usage/quota/limit", token: token, authPrefix: authPrefix)
+        let object = try Self.jsonObject(data)
         if let success = object["success"] as? Bool, !success {
-            log("GLM: API error code=\(object["code"] ?? "-") msg=\(object["msg"] ?? "-")")
-            completion(.success(.unavailable))
-            return
+            throw FetchError.parse("API error code=\(object["code"] ?? "-") msg=\(object["msg"] ?? "-")")
         }
         let payload = object["data"] as? [String: Any] ?? object
         let ordered = Self.orderedWindowLimits(in: payload)
         guard !ordered.isEmpty else {
-            log("GLM: no quota entries; keys=\(payload.keys.sorted())")
-            completion(.success(.unavailable))
-            return
+            throw FetchError.parse("no quota entries; keys=\(payload.keys.sorted())")
         }
         let fiveHour = Self.remainingFraction(ordered[0])
         let weekly = ordered.count > 1 ? Self.remainingFraction(ordered[1]) : nil
-        log("GLM: 5h=\(fiveHour.map(percent) ?? "-") W=\(weekly.map(percent) ?? "-") entries=\(ordered.count)")
-        completion(.success(Quota(fiveHourRemaining: fiveHour, weeklyRemaining: weekly, updatedAt: .now)))
+        log("GLM(\(id)): 5h=\(fiveHour.map(percent) ?? "-") W=\(weekly.map(percent) ?? "-") entries=\(ordered.count)")
+        return Quota(fiveHourRemaining: fiveHour, weeklyRemaining: weekly, updatedAt: .now)
+    }
+
+    static func jsonObject(_ data: Data) throws -> [String: Any] {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw FetchError.parse("response is not JSON: \(bodySnippet(data))")
+        }
+        return object
     }
 
     private static func tokenLimits(in object: [String: Any]) -> [[String: Any]] {
@@ -361,7 +491,7 @@ final class GLMProvider: QuotaProvider, @unchecked Sendable {
         }.map(\.element)
     }
 
-    private static func duration(_ item: [String: Any]) -> Double? {
+    static func duration(_ item: [String: Any]) -> Double? {
         for key in ["duration", "windowSeconds", "durationSeconds", "window", "cycle", "period"] {
             if let n = item[key] as? NSNumber { return n.doubleValue }
             if let s = item[key] as? String, let d = Double(s) { return d }
@@ -374,7 +504,7 @@ final class GLMProvider: QuotaProvider, @unchecked Sendable {
         return nil
     }
 
-    private static func remainingFraction(_ item: [String: Any]) -> Double? {
+    static func remainingFraction(_ item: [String: Any]) -> Double? {
         // percentage 为已用百分比;实测 usage=总额度、currentValue=已用、remaining=剩余
         if let p = item["percentage"] as? NSNumber { return max(0, min(1, 1 - p.doubleValue / 100)) }
         if let s = item["percentage"] as? String, let d = Double(s) { return max(0, min(1, 1 - d / 100)) }
@@ -418,34 +548,34 @@ extension GLMProvider {
     /// 按模型用量汇总:quota/limit 各窗口条目的 usageDetails(5h/周)+ model-usage(今日 token)。
     /// model-usage 无公开文档(结构取自 CodexBar 插件):请求带 startTime/endTime
     /// (YYYY-MM-DD HH:mm:ss),响应为 data.modelDataList[].{modelName, tokensUsage[](与 x_time 按下标对应)}。
-    static func fetchModelBreakdown(completion: @escaping @Sendable ([ModelUsage]?, String?) -> Void) {
-        guard let token = apiKey else {
-            completion(nil, "未找到 BIGMODEL_API_KEY(检查 ~/.zshrc)")
-            return
+    /// 两个数据源相互独立:任一失败不影响另一个,任一有数据即成功。
+    static func fetchModelBreakdown() async -> (rows: [ModelUsage]?, error: String?) {
+        guard let token = await apiKey(named: cnKeyNames) else {
+            return (nil, "未找到 BIGMODEL_API_KEY(检查 ~/.zshrc 或在初始化向导中填写)")
         }
-        fetchData(url: "https://open.bigmodel.cn/api/monitor/usage/quota/limit", token: token) { quotaResult in
-            let quota = parseResult(quotaResult, parser: parseBreakdown)
-            fetchData(url: modelUsageURL(), token: token) { usageResult in
-                let today = parseResult(usageResult, parser: parseModelUsage)
-                let rows = quota.rows + today.rows
-                if rows.isEmpty {
-                    completion(nil, quota.error ?? today.error ?? "接口未返回按模型用量数据")
-                } else {
-                    log("GLM model breakdown: \(rows.count) rows (quota=\(quota.rows.count) today=\(today.rows.count))")
-                    completion(rows, nil)
-                }
-            }
+        var rows: [ModelUsage] = []
+        var quotaCount = 0
+        var todayCount = 0
+        var firstError: String?
+        do {
+            let quotaRows = parseBreakdown(from: try await HTTP.getJSON("\(cnBaseURL)/api/monitor/usage/quota/limit", token: token))
+            quotaCount = quotaRows.count
+            rows += quotaRows
+        } catch {
+            firstError = error.localizedDescription
         }
-    }
-
-    private static func parseResult(
-        _ result: Result<Data, Error>,
-        parser: (Data) -> [ModelUsage]
-    ) -> (rows: [ModelUsage], error: String?) {
-        switch result {
-        case .success(let data): return (parser(data), nil)
-        case .failure(let error): return ([], error.localizedDescription)
+        do {
+            let todayRows = parseModelUsage(from: try await HTTP.getJSON(modelUsageURL(), token: token))
+            todayCount = todayRows.count
+            rows += todayRows
+        } catch {
+            if firstError == nil { firstError = error.localizedDescription }
         }
+        if rows.isEmpty {
+            return (nil, firstError ?? "接口未返回按模型用量数据")
+        }
+        log("GLM model breakdown: \(rows.count) rows (quota=\(quotaCount) today=\(todayCount))")
+        return (rows, nil)
     }
 
     /// model-usage 按时间段查询;取今天 00:00:00–23:59:59(本地时区)。
@@ -568,40 +698,25 @@ final class CustomProvider: QuotaProvider, @unchecked Sendable {
         self.displayName = config.name
     }
 
-    func fetch(completion: @escaping @Sendable (Result<Quota, Error>) -> Void) {
-        guard URL(string: config.url)?.scheme != nil else {
-            log("Custom \(config.name): invalid url")
-            completion(.success(.unavailable))
-            return
+    func fetchQuota() async throws -> Quota {
+        guard URL(string: config.url)?.scheme != nil else { throw FetchError.invalidURL }
+        let data = try await HTTP.getJSON(config.url, token: config.key.isEmpty ? nil : config.key)
+        guard let object = try? JSONSerialization.jsonObject(with: data) else {
+            throw FetchError.parse("response is not JSON: \(bodySnippet(data))")
         }
-        fetchData(url: config.url, token: config.key.isEmpty ? nil : config.key) { result in
-            switch result {
-            case .failure(let error):
-                log("Custom \(self.config.name) fetch failed: \(error.localizedDescription)")
-                completion(.success(.unavailable))
-            case .success(let data):
-                guard let object = try? JSONSerialization.jsonObject(with: data) else {
-                    log("Custom \(self.config.name): response is not JSON")
-                    completion(.success(.unavailable))
-                    return
-                }
-                let fiveHour = Self.remaining(Self.resolve(config.path5h, in: object), used: config.usedNotRemaining)
-                let weekly = config.pathWeekly.isEmpty
-                    ? nil
-                    : Self.remaining(Self.resolve(config.pathWeekly, in: object), used: config.usedNotRemaining)
-                if fiveHour == nil && weekly == nil {
-                    log("Custom \(self.config.name): paths not found (5h=\(config.path5h) weekly=\(config.pathWeekly))")
-                    completion(.success(.unavailable))
-                    return
-                }
-                log("Custom \(self.config.name): 5h=\(fiveHour.map(percent) ?? "-") W=\(weekly.map(percent) ?? "-")")
-                completion(.success(Quota(fiveHourRemaining: fiveHour, weeklyRemaining: weekly, updatedAt: .now)))
-            }
+        let fiveHour = Self.remaining(Self.resolve(config.path5h, in: object), used: config.usedNotRemaining)
+        let weekly = config.pathWeekly.isEmpty
+            ? nil
+            : Self.remaining(Self.resolve(config.pathWeekly, in: object), used: config.usedNotRemaining)
+        if fiveHour == nil && weekly == nil {
+            throw FetchError.parse("paths not found (5h=\(config.path5h) weekly=\(config.pathWeekly))")
         }
+        log("Custom \(config.name): 5h=\(fiveHour.map(percent) ?? "-") W=\(weekly.map(percent) ?? "-")")
+        return Quota(fiveHourRemaining: fiveHour, weeklyRemaining: weekly, updatedAt: .now)
     }
 
     /// "data.limits.0.percentage" 逐段下钻:数字段取数组下标,其余取字典键
-    private static func resolve(_ path: String, in json: Any) -> Double? {
+    static func resolve(_ path: String, in json: Any) -> Double? {
         var current: Any = json
         for part in path.split(separator: ".").map(String.init) {
             if let index = Int(part), let array = current as? [Any], array.indices.contains(index) {
@@ -615,7 +730,8 @@ final class CustomProvider: QuotaProvider, @unchecked Sendable {
         return number(current)
     }
 
-    private static func remaining(_ raw: Double?, used: Bool) -> Double? {
+    /// 字段是剩余或已用百分比;0-100 或 0-1 自动识别
+    static func remaining(_ raw: Double?, used: Bool) -> Double? {
         guard let raw else { return nil }
         let clamped = min(1, max(0, raw > 1 ? raw / 100 : raw))
         return used ? 1 - clamped : clamped
@@ -626,14 +742,27 @@ struct ProviderInfo: Sendable {
     let id: String
     let displayName: String
     let summary: String
+    /// 需要的密钥环境变量名;nil = 无需密钥
+    var secretName: String? = nil
+    /// 密钥获取方式提示(初始化向导展示)
+    var secretHint: String? = nil
+
+    /// 向导中"需要填密钥"才出现输入框
+    var requiresSecret: Bool { secretName != nil }
 }
 
 enum ProviderCatalog {
     static let builtin: [ProviderInfo] = [
-        ProviderInfo(id: "codex", displayName: "Codex", summary: "读取本地会话快照,无需密钥"),
-        ProviderInfo(id: "glm", displayName: "GLM(智谱)", summary: "Coding Plan;需 BIGMODEL_API_KEY"),
-        ProviderInfo(id: "minimax", displayName: "MiniMax", summary: "Token Plan;需 zshrc minimax 块密钥"),
-        ProviderInfo(id: "zenmux", displayName: "ZenMux", summary: "订阅额度;需 ZENMUX_MGMT_KEY"),
+        ProviderInfo(id: "codex", displayName: "Codex", summary: "读取本地 ~/.codex 会话快照,无需密钥"),
+        ProviderInfo(id: "glm", displayName: "GLM(智谱)", summary: "Coding Plan 国内版",
+                     secretName: "BIGMODEL_API_KEY", secretHint: "bigmodel.cn 控制台 → 套餐概览 → 新建 API Key"),
+        ProviderInfo(id: "zai", displayName: "GLM 国际版", summary: "z.ai Coding Plan(Global)",
+                     secretName: "ZAI_API_KEY", secretHint: "z.ai 平台 → API Keys(需国际版 Coding Plan)"),
+        ProviderInfo(id: "copilot", displayName: "Copilot", summary: "GitHub Copilot 高级请求额度(月度,显示在 W 列)",
+                     secretName: "GITHUB_TOKEN", secretHint: "GitHub → Settings → Developer settings → PAT(需 Copilot 订阅)"),
+        ProviderInfo(id: "minimax", displayName: "MiniMax", summary: "Token Plan(读取 ~/.zshrc minimax 块)"),
+        ProviderInfo(id: "zenmux", displayName: "ZenMux", summary: "订阅额度",
+                     secretName: "ZENMUX_MGMT_KEY", secretHint: "zenmux.ai → Management API Key(sk-mg-v1-*)"),
     ]
 
     /// 内置 + 用户在管理窗口添加的自定义套餐
@@ -644,10 +773,16 @@ enum ProviderCatalog {
         }
     }
 
+    static func info(id: String) -> ProviderInfo? {
+        all.first { $0.id == id }
+    }
+
     static func make(id: String) -> (any QuotaProvider)? {
         switch id {
         case "codex": return CodexProvider()
         case "glm": return GLMProvider()
+        case "zai": return GLMProvider.international()
+        case "copilot": return GitHubCopilotProvider()
         case "minimax": return MiniMaxProvider()
         case "zenmux": return ZenMuxProvider()
         default:
@@ -661,7 +796,7 @@ enum ProviderCatalog {
 
 enum ProviderStore {
     static let defaultsKey = "enabledProviders"
-    // ZenMux / MiniMax 保留实现但默认关闭;GLM 默认开启
+    // 初始化向导完成后由向导结果接管;未跑向导时保持原有默认(Codex + GLM)
     static let defaultEnabled = ["codex", "glm"]
 
     static var enabledIDs: [String] {
@@ -673,6 +808,22 @@ enum ProviderStore {
         var current = Set(enabledIDs)
         if on { current.insert(id) } else { current.remove(id) }
         UserDefaults.standard.set(ProviderCatalog.all.map(\.id).filter { current.contains($0) }, forKey: defaultsKey)
+    }
+
+    /// 整体替换启用列表(初始化向导完成时调用)
+    static func replaceAll(_ ids: Set<String>) {
+        UserDefaults.standard.set(ProviderCatalog.all.map(\.id).filter { ids.contains($0) }, forKey: defaultsKey)
+    }
+}
+
+/// 首次启动初始化向导的完成标记
+enum OnboardingStore {
+    static let defaultsKey = "hasCompletedOnboarding"
+
+    static var hasCompleted: Bool { UserDefaults.standard.bool(forKey: defaultsKey) }
+
+    static func markCompleted() {
+        UserDefaults.standard.set(true, forKey: defaultsKey)
     }
 }
 
@@ -715,18 +866,17 @@ final class ModelUsageStore: ObservableObject {
         guard force || Date().timeIntervalSince(lastFetch) > 150 else { return }
         guard !isLoading else { return }
         isLoading = true
-        GLMProvider.fetchModelBreakdown { [weak self] models, errorMessage in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.isLoading = false
-                self.lastFetch = Date()
-                if let models {
-                    self.models = models
-                    self.statusText = models.isEmpty ? "接口未返回按模型用量数据" : nil
-                    self.onModelsUpdated?()
-                } else {
-                    self.statusText = errorMessage
-                }
+        Task { [weak self] in
+            let (models, errorMessage) = await GLMProvider.fetchModelBreakdown()
+            guard let self else { return }
+            self.isLoading = false
+            self.lastFetch = Date()
+            if let models {
+                self.models = models
+                self.statusText = models.isEmpty ? "接口未返回按模型用量数据" : nil
+                self.onModelsUpdated?()
+            } else {
+                self.statusText = errorMessage
             }
         }
     }
@@ -744,37 +894,44 @@ final class ModelUsageStore: ObservableObject {
 
 private enum FetchError: LocalizedError {
     case invalidURL
-    case transport(Error)
-    case http(Int)
     case empty
+    case http(Int, snippet: String)
+    case parse(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidURL: return "invalid URL"
-        case .transport(let error): return "transport: \(error.localizedDescription)"
-        case .http(let code): return "HTTP \(code)"
         case .empty: return "empty body"
+        case .http(let code, let snippet): return "HTTP \(code)\(snippet.isEmpty ? "" : ": \(snippet)")"
+        case .parse(let detail): return detail
         }
     }
 }
 
-private func fetchData(url address: String, token: String?, completion: @escaping @Sendable (Result<Data, Error>) -> Void) {
-    guard let url = URL(string: address) else { completion(.failure(FetchError.invalidURL)); return }
-    var request = URLRequest(url: url, timeoutInterval: 12)
-    request.httpMethod = "GET"
-    if let token, !token.isEmpty {
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-    }
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    URLSession.shared.dataTask(with: request) { data, response, error in
-        if let error { completion(.failure(FetchError.transport(error))); return }
-        guard let data, !data.isEmpty else { completion(.failure(FetchError.empty)); return }
-        guard let http = response as? HTTPURLResponse else { completion(.success(data)); return }
-        guard (200..<300).contains(http.statusCode) else {
-            completion(.failure(FetchError.http(http.statusCode))); return
+/// 响应体前 160 字节,用于失败日志定位
+func bodySnippet(_ data: Data) -> String {
+    String(data: data.prefix(160), encoding: .utf8) ?? ""
+}
+
+private enum HTTP {
+    /// GET JSON。显式绕过 URLCache(额度接口的响应不应复用缓存);
+    /// authPrefix 为 Authorization 前缀(默认 "Bearer";z.ai 要求原始 key 传 nil,GitHub 惯例 "token")。
+    /// 传输错误直接抛 URLError,HTTP 非 2xx 带响应片段抛 http 错误,便于日志定位。
+    static func getJSON(_ address: String, token: String?, authPrefix: String? = "Bearer", timeout: TimeInterval = 12) async throws -> Data {
+        guard let url = URL(string: address) else { throw FetchError.invalidURL }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+        request.httpMethod = "GET"
+        if let token, !token.isEmpty {
+            request.setValue(authPrefix.map { "\($0) \(token)" } ?? token, forHTTPHeaderField: "Authorization")
         }
-        completion(.success(data))
-    }.resume()
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw FetchError.http(http.statusCode, snippet: bodySnippet(data))
+        }
+        guard !data.isEmpty else { throw FetchError.empty }
+        return data
+    }
 }
 
 
@@ -783,6 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var providers: [any QuotaProvider] = ProviderStore.enabledIDs.compactMap { ProviderCatalog.make(id: $0) }
     private var configWindow: NSWindow?
     private var modelWindow: NSWindow?
+    private var onboardingWindow: NSWindow?
     private let modelStore = ModelUsageStore()
     private var quotas: [String: Quota] = [:]
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -805,8 +963,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in self?.refresh() }
         }
         refreshTimer?.tolerance = 3
+        // 首次启动弹初始化向导;完成后 applyProviderChange 按用户选择重建套餐
+        if !OnboardingStore.hasCompleted {
+            openOnboarding()
+        }
     }
 
+    @objc private func openOnboarding() {
+        if let onboardingWindow {
+            onboardingWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 540),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "欢迎使用 AI Quota Bar"
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: OnboardingView(onFinish: { [weak self, weak window] in
+            window?.close()
+            self?.onboardingWindow = nil
+            self?.applyProviderChange()
+        }))
+        window.center()
+        onboardingWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
     @objc private func openConfig() {
         // 每次重建窗口:套餐目录(含自定义)可能已变化,避免显示过期列表
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 620),
@@ -843,7 +1025,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
     }
 
+    /// 菜单/定时器入口:同步方法,内部启动异步刷新周期
     @objc private func refresh() {
+        Task { @MainActor in await self.refreshCycle() }
+    }
+
+    /// 并发拉取全部启用套餐;任一失败记录日志并把该套餐显示为 "—"。
+    /// provider 不再各自吞错,失败原因(缺 key、success=false、HTTP 状态等)统一从这里进日志。
+    private func refreshCycle() async {
         guard !isRefreshing else {
             log("refresh skipped: previous refresh is still running")
             return
@@ -853,20 +1042,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if providers.contains(where: { $0.id == "glm" }) {
             modelStore.refreshIfNeeded()
         }
-        let group = DispatchGroup()
-        providers.forEach { provider in
-            group.enter()
-            provider.fetch { [weak self] result in
-                DispatchQueue.main.async {
-                    if case .success(let quota) = result { self?.quotas[provider.id] = quota }
-                    group.leave()
+        let results = await withTaskGroup(of: (String, Result<Quota, Error>).self) { group in
+            for provider in providers {
+                group.addTask {
+                    do { return (provider.id, .success(try await provider.fetchQuota())) }
+                    catch { return (provider.id, .failure(error)) }
                 }
             }
+            var collected: [(String, Result<Quota, Error>)] = []
+            for await item in group { collected.append(item) }
+            return collected
         }
-        group.notify(queue: .main) { [weak self] in
-            self?.isRefreshing = false
-            self?.rebuildMenu()
+        for (id, result) in results {
+            switch result {
+            case .success(let quota):
+                quotas[id] = quota
+            case .failure(let error):
+                log("\(id) fetch failed: \(error.localizedDescription)")
+                quotas[id] = .unavailable
+            }
         }
+        isRefreshing = false
+        rebuildMenu()
     }
 
     private func rebuildMenu() {
@@ -896,6 +1093,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let config = NSMenuItem(title: "管理套餐…", action: #selector(openConfig), keyEquivalent: ",")
         config.target = self
         menu.addItem(config)
+        let onboarding = NSMenuItem(title: "初始化向导…", action: #selector(openOnboarding), keyEquivalent: "")
+        onboarding.target = self
+        menu.addItem(onboarding)
         let modelConfig = NSMenuItem(title: "模型配置…", action: #selector(openModelConfig), keyEquivalent: "")
         modelConfig.target = self
         menu.addItem(modelConfig)
@@ -1217,7 +1417,7 @@ struct ConfigView: View {
                     form
                 }
                 Divider()
-                Text("GLM 额度:从环境变量 BIGMODEL_API_KEY(或 ~/.zshrc 同名变量)读取,使用绑定 Coding Plan 的 key。若失效,到 bigmodel.cn 控制台 → 套餐概览 重新获取。")
+                Text("密钥读取顺序:环境变量 → 初始化向导保存(明文本机 UserDefaults)→ ~/.zshrc 同名变量,改动即时生效无需重启。GLM key 在 bigmodel.cn 控制台 → 套餐概览 获取,需绑定 Coding Plan。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let errorText {
@@ -1318,6 +1518,137 @@ struct ConfigView: View {
         newUsedNotRemaining = false
         errorText = nil
         onApplied()
+    }
+}
+
+/// 首次启动初始化向导:选平台 → 填密钥(可跳过)→ 立即生效。
+/// 不再默认启用任何套餐,由用户在向导中勾选;可从菜单随时重跑。
+struct OnboardingView: View {
+    var onFinish: () -> Void
+
+    @State private var step = 0 // 0 欢迎 · 1 选平台 · 2 密钥
+    @State private var selected: Set<String> = []
+    @State private var keys: [String: String] = [:]
+
+    private var catalog: [ProviderInfo] { ProviderCatalog.builtin }
+    private var selectedInfos: [ProviderInfo] {
+        catalog.filter { selected.contains($0.id) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            switch step {
+            case 0: welcome
+            case 1: pickPlatforms
+            default: enterSecrets
+            }
+            Divider()
+            HStack {
+                if step > 0 {
+                    Button("上一步") { withAnimation { step -= 1 } }
+                }
+                Spacer()
+                if step < 2 {
+                    Button(step == 0 ? "开始" : "下一步") { withAnimation { step += 1 } }
+                        .disabled(step == 1 && selected.isEmpty)
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Button("完成") { finish() }
+                        .disabled(selected.isEmpty)
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 500, alignment: .topLeading)
+    }
+
+    private var welcome: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("欢迎使用 AI Quota Bar")
+                .font(.title2.weight(.semibold))
+            Text("菜单栏常驻显示各 AI 编程套餐的 5 小时 / 一周剩余额度,30 秒自动刷新,点击查看概览。")
+            VStack(alignment: .leading, spacing: 6) {
+                Label("所有密钥与数据只保存在本机,不经过任何第三方", systemImage: "lock.shield")
+                Label("支持 Codex / GLM / GLM 国际版 / Copilot / MiniMax / ZenMux,以及任意 GET JSON 接口", systemImage: "list.bullet.rectangle")
+                Label("之后可随时在「管理套餐」中增删或重跑本向导", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            Text("选择你正在使用的平台,开始配置 ↓")
+                .font(.callout.weight(.medium))
+        }
+    }
+
+    private var pickPlatforms: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("选择要监控的套餐")
+                .font(.title3.weight(.semibold))
+            ForEach(catalog, id: \.id) { info in
+                Toggle(isOn: Binding(
+                    get: { selected.contains(info.id) },
+                    set: { on in
+                        if on { selected.insert(info.id) } else { selected.remove(info.id) }
+                    }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(info.displayName)
+                            .font(.system(size: 13, weight: .medium))
+                        Text(info.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            if selected.isEmpty {
+                Text("至少选择一个套餐才能继续。")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private var enterSecrets: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("填写 API 密钥(可跳过)")
+                .font(.title3.weight(.semibold))
+            let needingKeys = selectedInfos.filter(\.requiresSecret)
+            if needingKeys.isEmpty {
+                Text("所选套餐均无需密钥。")
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(needingKeys, id: \.id) { info in
+                VStack(alignment: .leading, spacing: 4) {
+                    SecureField(info.secretName ?? "", text: bindingKey(info))
+                        .textFieldStyle(.roundedBorder)
+                    Text(info.secretHint ?? "")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Label("密钥明文保存在本机 UserDefaults,不随仓库分发、不出进程", systemImage: "lock")
+                Label("留空 = 暂不保存;稍后写入 ~/.zshrc 同名变量也行,改动即时生效,无需重启", systemImage: "clock.arrow.circlepath")
+                Label("MiniMax 从 ~/.zshrc 的 minimax PLAN 块读取 ANTHROPIC_API_KEY", systemImage: "terminal")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private func bindingKey(_ info: ProviderInfo) -> Binding<String> {
+        Binding(get: { keys[info.id] ?? "" }, set: { keys[info.id] = $0 })
+    }
+
+    private func finish() {
+        for info in selectedInfos {
+            guard let name = info.secretName, let key = keys[info.id], !key.isEmpty else { continue }
+            SecretOverrides.set(name: name, value: key)
+        }
+        ProviderStore.replaceAll(selected)
+        OnboardingStore.markCompleted()
+        onFinish()
     }
 }
 
